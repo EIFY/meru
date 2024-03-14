@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 import torch
 from PIL import Image
@@ -28,8 +29,10 @@ parser = argparse.ArgumentParser(description=__doc__)
 _AA = parser.add_argument
 _AA("--checkpoint-path", help="Path to checkpoint of a trained MERU/CLIP model.")
 _AA("--train-config", help="Path to train config (.yaml/py) for given checkpoint.")
-_AA("--image-path", help="Path to an image (.jpg) for perfoming traversal.")
+_AA("--image-dir", help="Directory of images (.jpg) for perfoming traversal.")
 _AA("--steps", type=int, default=50, help="Number of traversal steps.")
+_AA("--output-json", default="output.json", help="Output JSON file path to write the results.")
+_AA("--min-radius", type=float, default=0.0, help="Radius of the epsilon-ball within which aperture is undefined.")
 
 
 def interpolate(model, feats: torch.Tensor, root_feat: torch.Tensor, steps: int):
@@ -60,7 +63,7 @@ def interpolate(model, feats: torch.Tensor, root_feat: torch.Tensor, steps: int)
 
 
 def calc_scores(
-    model, image_feats: torch.Tensor, text_feats: torch.Tensor, has_root: bool
+    model, image_feats: torch.Tensor, text_feats: torch.Tensor, has_root: bool, min_radius: float
 ):
     """
     Calculate similarity scores between the given image and text features depending
@@ -73,20 +76,20 @@ def calc_scores(
 
     if isinstance(model, MERU):
         scores = L.pairwise_inner(image_feats, text_feats, model.curv.exp())
+        if min_radius:
+            # For MERU, exclude text embeddings that do not entail the given image.
+            _aper = L.half_aperture(text_feats, model.curv.exp(), min_radius)
+            _oxy_angle = L.oxy_angle(
+                text_feats[:, None, :], image_feats[None, :, :], model.curv.exp()
+            )
+            entailment_energy = _oxy_angle - _aper[..., None]
 
-        # For MERU, exclude text embeddings that do not entail the given image.
-        _aper = L.half_aperture(text_feats, model.curv.exp())
-        _oxy_angle = L.oxy_angle(
-            text_feats[:, None, :], image_feats[None, :, :], model.curv.exp()
-        )
-        entailment_energy = _oxy_angle - _aper[..., None]
+            # Root entails everything.
+            if has_root:
+                entailment_energy[-1, ...] = 0
 
-        # Root entails everything.
-        if has_root:
-            entailment_energy[-1, ...] = 0
-
-        # Set a large negative score if text does not entail image.
-        scores[entailment_energy.T > 0] = -1e12
+            # Set a large negative score if text does not entail image.
+            scores[entailment_energy.T > 0] = -1e12
         return scores
     else:
         # model is not needed here.
@@ -159,29 +162,42 @@ def main(_A: argparse.Namespace):
     text_feats_pool = torch.cat([text_feats_pool, root_feat[None, ...]])
 
     # ------------------------------------------------------------------------
-    print(f"\nPerforming image traversals with source: {_A.image_path}...")
+    print(f"\nPerforming image traversals with source: {_A.image_dir}...")
     # ------------------------------------------------------------------------
-    image = Image.open(_A.image_path).convert("RGB")
 
-    image_transform = T.Compose(
-        [T.Resize(224, T.InterpolationMode.BICUBIC), T.CenterCrop(224), T.ToTensor()]
-    )
-    image = image_transform(image).to(device)
-    image_feats = model.encode_image(image[None, ...], project=True)[0]
+    output_dict = {}
+    for image_file in os.listdir(_A.image_dir):
+        image_path = os.path.join(_A.image_dir, image_file)
+        if os.path.isfile(image_path):
 
-    interp_feats = interpolate(model, image_feats, root_feat, _A.steps)
-    nn1_scores = calc_scores(model, interp_feats, text_feats_pool, has_root=True)
+            image = Image.open(image_path).convert("RGB")
 
-    nn1_scores, _nn1_idxs = nn1_scores.max(dim=-1)
-    nn1_texts = [text_pool[_idx.item()] for _idx in _nn1_idxs]
+            image_transform = T.Compose(
+                [T.Resize(224, T.InterpolationMode.BICUBIC), T.CenterCrop(224), T.ToTensor()]
+            )
+            image = image_transform(image).to(device)
+            image_feats = model.encode_image(image[None, ...], project=True)[0]
 
-    # De-duplicate retrieved texts (multiple points may have same NN) and print.
-    print(f"Texts retrieved from [IMAGE] -> [ROOT] traversal:")
-    unique_nn1_texts = []
-    for _text in nn1_texts:
-        if _text not in unique_nn1_texts:
-            unique_nn1_texts.append(_text)
-            print(f"  - {_text}")
+            interp_feats = interpolate(model, image_feats, root_feat, _A.steps)
+            nn1_scores = calc_scores(model, interp_feats, text_feats_pool, has_root=True, min_radius=_A.min_radius)
+
+            nn1_scores, _nn1_idxs = nn1_scores.max(dim=-1)
+            nn1_texts = [text_pool[_idx.item()] for _idx in _nn1_idxs]
+
+            # De-duplicate retrieved texts (multiple points may have same NN) and print.
+            print(f"Texts retrieved from [IMAGE] -> [ROOT] traversal:")
+            unique_nn1_texts = []
+            for _text in nn1_texts:
+                if _text not in unique_nn1_texts:
+                    unique_nn1_texts.append(_text)
+                    print(f"  - {_text}")
+            output_dict[image_file] = unique_nn1_texts
+
+    # Write results to JSON file
+    with open(_A.output_json, "w") as json_file:
+        json.dump(output_dict, json_file)
+
+    print("Results written to:", _A.output_json)
 
 
 if __name__ == "__main__":
